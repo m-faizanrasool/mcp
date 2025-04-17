@@ -45,10 +45,10 @@ const server = new McpServer({
 // Initialize database connection
 async function initializeDatabase(): Promise<AppContext> {
     const config = {
-        host: "localhost",
-        database: "theportal_test",
-        user: "root",
-        password: "",
+        host: "nternational.org",
+        database: "xylbs_theportal_dev",
+        user: "xylbs_development",
+        password: "xylbs_development",
     };
 
     try {
