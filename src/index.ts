@@ -1,9 +1,11 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import mysql from "mysql2/promise";
 import fs from "fs";
 import path from "path";
+import express from "express";
+import cors from "cors";
 
 // Configure logging
 const logDir = path.resolve("./logs");
@@ -327,17 +329,78 @@ async function main() {
         // Initialize the database
         await initializeDatabase();
 
-        // Start the server with stdio transport
-        const transport = new StdioServerTransport();
+        // Set up Express application
+        const app = express();
 
-        // This is the key fix - we need to properly handle the connection
-        await server.connect(transport);
+        // Enable CORS
+        app.use(cors());
 
-        log("INFO", "Server connected successfully");
+        // Parse JSON bodies
+        app.use(express.json());
+
+        // Track transport sessions
+        const transports: { [sessionId: string]: SSEServerTransport } = {};
+
+        // SSE endpoint
+        app.get("/sse", async (_: express.Request, res: express.Response) => {
+            log("INFO", "New SSE connection established");
+            const POST_ENDPOINT = "/messages";
+            const transport = new SSEServerTransport(POST_ENDPOINT, res);
+            transports[transport.sessionId] = transport;
+
+            res.on("close", () => {
+                log("INFO", `SSE connection closed for session ${transport.sessionId}`);
+                delete transports[transport.sessionId];
+            });
+
+            await server.connect(transport);
+            await sendConnectionConfirmation(transport);
+        });
+
+        // Message endpoint
+        app.post("/messages", async (req: express.Request, res: express.Response) => {
+            const sessionId = req.query.sessionId as string;
+            const transport = transports[sessionId];
+
+            if (!sessionId) {
+                res.status(400).send({ message: "Bad session id" });
+                return;
+            }
+
+            if (transport) {
+                await transport.handlePostMessage(req, res, req.body);
+            } else {
+                log("ERROR", `No transport found for sessionId: ${sessionId}`);
+                res.status(400).send('No transport found for sessionId');
+            }
+        });
+
+        // Health check endpoint
+        app.get("/health", (_: express.Request, res: express.Response) => {
+            const dbStatus = dbConnection ? "connected" : "disconnected";
+            res.json({
+                status: "ok",
+                database: dbStatus,
+            });
+        });
+
+        // Start server
+        const PORT = process.env.PORT || 3001;
+        app.listen(PORT, () => {
+            log("INFO", `MCP HTTP server running on port ${PORT}`);
+        });
     } catch (err: any) {
         log("CRITICAL", "Server crashed with error: " + err.message, err);
         process.exit(1);
     }
+}
+
+async function sendConnectionConfirmation(transport: SSEServerTransport) {
+    await transport.send({
+        jsonrpc: "2.0",
+        method: "sse/connection",
+        params: { message: "MCP connection established" }
+    });
 }
 
 main();
