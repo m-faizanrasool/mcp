@@ -1,11 +1,11 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
-import mysql from "mysql2/promise";
 import fs from "fs";
 import path from "path";
 import express from "express";
 import cors from "cors";
+import axios from "axios";
 
 // Configure logging
 const logDir = path.resolve("./logs");
@@ -22,19 +22,19 @@ function log(level: string, message: string, error?: any) {
     logStream.write(logMessage + "\n");
 }
 
-// Define the connection state
-type AppContext = {
-    connection: mysql.Connection | null;
-    config: {
-        host: string;
-        database: string;
-        user: string;
-        password: string;
-    };
-};
+// Define API client
+const API_BASE_URL = process.env.API_BASE_URL || "https://dev-theportal.xyzlabs.org/api/mcp";
+// const API_BASE_URL = process.env.API_BASE_URL || "http://theportal.org/api/mcp";
+const API_TOKEN = process.env.API_TOKEN || "$2y$10$8p6zM3slVFLBkzOomwgDROBm6Wy06ipGLI00vcDhxWV8.gcaTiBVW";
 
-// Global state
-let dbConnection: mysql.Connection | null = null;
+const apiClient = axios.create({
+    baseURL: API_BASE_URL,
+    headers: {
+        'Authorization': `Bearer ${API_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+});
 
 // Create an MCP server with a name
 const server = new McpServer({
@@ -42,75 +42,27 @@ const server = new McpServer({
     version: "1.0.0",
 });
 
-// Initialize database connection
-async function initializeDatabase(): Promise<AppContext> {
-    const config = {
-        host: "nternational.org",
-        database: "xylbs_theportal_dev",
-        user: "xylbs_development",
-        password: "xylbs_development",
-    };
-
-    try {
-        log("INFO", "Connecting to MySQL Database: " + config.database);
-        const connection = await mysql.createConnection({
-            host: config.host,
-            database: config.database,
-            user: config.user,
-            password: config.password,
-        });
-
-        dbConnection = connection;
-        log("INFO", "Connected to MySQL Database: " + config.database);
-
-        // Handle process termination
-        process.on("exit", () => closeConnection());
-        process.on("SIGINT", () => {
-            closeConnection();
-            process.exit(0);
-        });
-
-        return { connection, config };
-    } catch (err: any) {
-        log("ERROR", "Error connecting to MySQL: " + err.message, err);
-        return { connection: null, config };
-    }
-}
-
-async function closeConnection() {
-    if (dbConnection) {
-        try {
-            await dbConnection.end();
-            log("INFO", "MySQL connection closed");
-            dbConnection = null;
-        } catch (err: any) {
-            log("ERROR", "Error closing MySQL connection: " + err.message, err);
-        }
-    }
-}
-
 // Resource to list available tables
 server.resource(
     "tables",
     "schema://tables",
     async (uri) => {
-        if (!dbConnection) {
-            return {
-                contents: [{
-                    uri: uri.href,
-                    text: "Database connection is not available"
-                }]
-            };
-        }
-
         try {
-            const [rows] = await dbConnection.query('SHOW TABLES');
-            const tables = rows as any[];
+            const response = await apiClient.get('/tables');
 
+            if (response.status !== 200) {
+                return {
+                    contents: [{
+                        uri: uri.href,
+                        text: "Error fetching tables: " + response.statusText
+                    }]
+                };
+            }
+
+            const tables = response.data.tables;
             let result = "Available tables:\n";
             for (const table of tables) {
-                const tableName = Object.values(table)[0];
-                result += `- ${tableName}\n`;
+                result += `- ${table}\n`;
             }
 
             return {
@@ -136,26 +88,26 @@ server.resource(
     "table-schema",
     new ResourceTemplate("schema://tables/{table_name}", { list: undefined }),
     async (uri, { table_name }) => {
-        if (!dbConnection) {
-            return {
-                contents: [{
-                    uri: uri.href,
-                    text: "Database connection is not available"
-                }]
-            };
-        }
-
         try {
-            const [columns] = await dbConnection.query(`DESCRIBE ${table_name}`);
-            const columnData = columns as any[];
+            const response = await apiClient.get(`/tables/${table_name}/schema`);
 
+            if (response.status !== 200) {
+                return {
+                    contents: [{
+                        uri: uri.href,
+                        text: "Error fetching schema: " + response.statusText
+                    }]
+                };
+            }
+
+            const columns = response.data.columns;
             let result = `Schema for table '${table_name}':\n`;
-            for (const column of columnData) {
-                result += `- ${column.Field} (${column.Type})`;
-                if (column.Key === "PRI") {
+            for (const column of columns) {
+                result += `- ${column.name} (${column.type})`;
+                if (column.primary) {
                     result += " PRIMARY KEY";
                 }
-                if (column.Null === "NO") {
+                if (column.required) {
                     result += " NOT NULL";
                 }
                 result += "\n";
@@ -184,37 +136,31 @@ server.tool(
     "run_query",
     { query: z.string() },
     async ({ query }) => {
-        if (!dbConnection) {
-            return {
-                content: [{ type: "text", text: "Database connection is not available" }]
-            };
-        }
-
-        // Safety check for read-only queries
-        const queryLower = query.toLowerCase().trim();
-        if (!queryLower.startsWith("select") && !queryLower.startsWith("show")) {
-            return {
-                content: [{ type: "text", text: "Only SELECT and SHOW queries are allowed for safety reasons" }]
-            };
-        }
-
         try {
-            const [results] = await dbConnection.query(query);
-            const rows = results as any[];
+            const response = await apiClient.post('/query', { query });
 
-            if (!rows || rows.length === 0) {
+            if (response.status !== 200) {
+                return {
+                    content: [{ type: "text", text: "Error executing query: " + response.statusText }],
+                    isError: true
+                };
+            }
+
+            const results = response.data.results;
+
+            if (!results || results.length === 0) {
                 return {
                     content: [{ type: "text", text: "Query executed successfully but returned no results" }]
                 };
             }
 
             // Format results as a table
-            const headers = Object.keys(rows[0]);
+            const headers = Object.keys(results[0]);
             const headerRow = headers.join(" | ");
             const separator = "-".repeat(headerRow.length);
 
             let output = `${headerRow}\n${separator}\n`;
-            for (const row of rows) {
+            for (const row of results) {
                 output += Object.values(row).map(value => String(value)).join(" | ") + "\n";
             }
 
@@ -239,30 +185,22 @@ server.tool(
         target_folder_id: z.string()
     },
     async ({ document_id, target_folder_id }) => {
-        if (!dbConnection) {
-            return {
-                content: [{ type: "text", text: "Database connection is not available" }]
-            };
-        }
-
         try {
-            const [result] = await dbConnection.query(
-                "UPDATE user_openai SET folder_id = ? WHERE id = ?",
-                [target_folder_id, document_id]
-            );
+            const response = await apiClient.post('/documents/move', {
+                document_id,
+                target_folder_id
+            });
 
-            const updateResult = result as any;
-            const affectedRows = updateResult.affectedRows;
-
-            if (affectedRows > 0) {
+            if (response.status !== 200) {
                 return {
-                    content: [{ type: "text", text: `Successfully moved document ${document_id} to folder ${target_folder_id}` }]
-                };
-            } else {
-                return {
-                    content: [{ type: "text", text: `Document ${document_id} not found or already in folder ${target_folder_id}` }]
+                    content: [{ type: "text", text: "Error moving document: " + response.statusText }],
+                    isError: true
                 };
             }
+
+            return {
+                content: [{ type: "text", text: response.data.message || `Successfully moved document ${document_id} to folder ${target_folder_id}` }]
+            };
         } catch (err: any) {
             log("ERROR", `Error moving document: ${err.message}`, err);
             return {
@@ -326,9 +264,6 @@ async function main() {
     try {
         log("INFO", "Starting MCP server...");
 
-        // Initialize the database
-        await initializeDatabase();
-
         // Set up Express application
         const app = express();
 
@@ -377,10 +312,9 @@ async function main() {
 
         // Health check endpoint
         app.get("/health", (_: express.Request, res: express.Response) => {
-            const dbStatus = dbConnection ? "connected" : "disconnected";
             res.json({
                 status: "ok",
-                database: dbStatus,
+                api_connection: true
             });
         });
 
